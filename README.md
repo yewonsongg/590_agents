@@ -23,6 +23,10 @@ The `krisj_echo` agent returns the instruction without tools or API requests. Th
 raises `NotImplementedError` until implemented. Its settings already support
 per-run model overrides through `RunContext.model`.
 
+`yewons_stale_path` uses the Responses API and shell commands to find and fix
+stale resource paths, then check the changes. It uses the shared UNC Azure settings
+and runs commands in the selected working directory, with time and output limits.
+
 For use outside this checkout:
 
 ```sh
