@@ -16,6 +16,7 @@ openai-smoke = "agents590.smoke:main"
 [project.entry-points."agents590.agents"]
 krisj_starter = "agents590.krisj_starter:StarterAgent"
 krisj_echo = "agents590.krisj_echo:EchoAgent"
+yewons_stale_path = "agents590.yewons_stale_path:StalePathAgent"
 
 [dependency-groups]
 dev = [
