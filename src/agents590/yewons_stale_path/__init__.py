@@ -2,7 +2,8 @@
 
 import asyncio
 import json
-import sys
+import os
+from time import monotonic
 from typing import cast
 
 from openai import APIError
@@ -10,7 +11,13 @@ from openai.types.responses import ResponseInputItemParam, ResponseInputParam
 
 from agents590.contracts import RunContext
 from agents590.provider import UNCOpenAISettings
-from agents590.yewons_stale_path.tools import MAX_OUTPUT_BYTES, execute_shell, shell_tool
+from agents590.yewons_stale_path.diagnostics import RunDiagnostics
+from agents590.yewons_stale_path.tools import (
+    MAX_OUTPUT_BYTES,
+    ShellStats,
+    execute_shell,
+    shell_tool,
+)
 
 SYSTEM_PROMPT = """Repair stale resource paths using the task's project files.
 Inspect relevant readers, configuration, and assets before making minimal edits.
@@ -45,6 +52,22 @@ class StalePathAgent:
         """Inspect, edit, and verify files using model-selected shell commands."""
         settings = self.provider_settings(context)
         tool = shell_tool(self.max_shell_output_bytes)
+        log = RunDiagnostics(
+            (
+                settings.api_key,
+                os.environ.get("OPENAI_API_KEY", ""),
+                os.environ.get("AZURE_OPENAI_API_KEY", ""),
+            )
+        )
+        log.emit(
+            "run_start",
+            model=settings.model,
+            cwd=str(context.cwd),
+            max_steps=self.max_steps,
+            max_output_tokens=self.max_output_tokens,
+            max_shell_output_bytes=self.max_shell_output_bytes,
+        )
+        status = "error"
         history: ResponseInputParam = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": instruction},
@@ -53,6 +76,9 @@ class StalePathAgent:
             async with asyncio.timeout(self.run_timeout_seconds):
                 async with settings.create_async_client() as client:
                     for step in range(self.max_steps):
+                        log.requests += 1
+                        log.emit("model_request", step=step + 1, history_items=len(history))
+                        requested_at = monotonic()
                         response = await client.responses.create(
                             model=settings.model,
                             input=history,
@@ -63,13 +89,7 @@ class StalePathAgent:
                             store=False,
                             background=False,
                         )
-                        if response.usage is not None:
-                            print(
-                                f"Model step {step + 1}: "
-                                f"input_tokens={response.usage.input_tokens}, "
-                                f"output_tokens={response.usage.output_tokens}",
-                                file=sys.stderr,
-                            )
+                        log.model_response(step + 1, response, (monotonic() - requested_at) * 1000)
                         if response.status != "completed":
                             raise ValueError(
                                 f"Model response did not complete (status={response.status})."
@@ -83,19 +103,40 @@ class StalePathAgent:
                         calls = [item for item in response.output if item.type == "function_call"]
                         if not calls:
                             if response.output_text.strip():
+                                status = "completed"
                                 return response.output_text
                             raise ValueError(
                                 "Model returned neither a tool call nor a final answer."
                             )
                         for call in calls:
-                            if call.name == "shell":
-                                result = await execute_shell(
-                                    call.arguments,
-                                    context.cwd,
-                                    max_output_bytes=self.max_shell_output_bytes,
+                            log.tool_start(step + 1, call, context.cwd)
+                            tool_started_at = monotonic()
+                            stats = ShellStats()
+                            result: str | None = None
+                            error_type: str | None = None
+                            try:
+                                if call.name == "shell":
+                                    result = await execute_shell(
+                                        call.arguments,
+                                        context.cwd,
+                                        max_output_bytes=self.max_shell_output_bytes,
+                                        stats=stats,
+                                    )
+                                else:
+                                    result = json.dumps({"error": f"Unknown tool: {call.name}"})
+                            except (Exception, asyncio.CancelledError) as error:
+                                error_type = type(error).__name__
+                                raise
+                            finally:
+                                log.tool_end(
+                                    step + 1,
+                                    call,
+                                    stats,
+                                    result,
+                                    error_type,
+                                    (monotonic() - tool_started_at) * 1000,
                                 )
-                            else:
-                                result = json.dumps({"error": f"Unknown tool: {call.name}"})
+                            assert result is not None
                             history.append(
                                 {
                                     "type": "function_call_output",
@@ -103,11 +144,21 @@ class StalePathAgent:
                                     "output": result,
                                 }
                             )
+            status = "step_limit"
+            raise ValueError(
+                f"Agent reached its {self.max_steps}-step limit without a final answer."
+            )
         except TimeoutError:
+            status = "timeout"
             raise ValueError(
                 f"Agent exceeded its {self.run_timeout_seconds:g}-second run limit."
             ) from None
         except APIError as error:
+            status = "api_error"
             # Provider errors can contain request details; keep CLI errors succinct.
             raise ValueError(f"Responses API request failed ({type(error).__name__}).") from None
-        raise ValueError(f"Agent reached its {self.max_steps}-step limit without a final answer.")
+        except asyncio.CancelledError:
+            status = "cancelled"
+            raise
+        finally:
+            log.finish(status)

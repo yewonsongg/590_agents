@@ -17,6 +17,7 @@ from openai import AsyncOpenAI
 from agents590 import provider, registry
 from agents590.contracts import RunContext
 from agents590.yewons_stale_path import StalePathAgent, tools
+from agents590.yewons_stale_path.diagnostics import RunDiagnostics
 
 
 @dataclass
@@ -25,7 +26,12 @@ class MockModel:
     requests: list[dict[str, Any]] = field(default_factory=list)
     client: httpx.AsyncClient = field(init=False)
 
-    def respond(self, *output: dict[str, object], status: str = "completed") -> None:
+    def respond(
+        self,
+        *output: dict[str, object],
+        status: str = "completed",
+        usage: dict[str, object] | None = None,
+    ) -> None:
         self.replies.append(
             httpx.Response(
                 200,
@@ -35,6 +41,7 @@ class MockModel:
                     "created_at": 0,
                     "status": status,
                     "output": list(output),
+                    "usage": usage,
                 },
             )
         )
@@ -166,7 +173,12 @@ def test_mocked_loop_repairs_files_and_replays_reasoning(model: MockModel, tmp_p
     ],
 )
 def test_bad_calls_return_errors_to_model(
-    model: MockModel, tmp_path: Path, tool_name: str, arguments: str, error: str
+    model: MockModel,
+    tmp_path: Path,
+    tool_name: str,
+    arguments: str,
+    error: str,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     model.respond(call(arguments, name=tool_name))
     model.respond(message("Could not execute that call."))
@@ -175,9 +187,15 @@ def test_bad_calls_return_errors_to_model(
     )
     output = json.loads(model.requests[1]["input"][-1]["output"])
     assert error in output["error"]
+    events = [json.loads(line) for line in capsys.readouterr().err.splitlines()]
+    tool_end = next(event for event in events if event["event"] == "tool_end")
+    assert tool_end["status"] == "failed"
+    assert error in tool_end["error"]
 
 
-def test_step_limit_closes_client(model: MockModel, tmp_path: Path) -> None:
+def test_step_limit_closes_client(
+    model: MockModel, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     model.respond(call("{}"))
     agent = StalePathAgent()
     agent.max_steps = 1
@@ -185,15 +203,25 @@ def test_step_limit_closes_client(model: MockModel, tmp_path: Path) -> None:
         asyncio.run(agent.run("Test", RunContext(cwd=tmp_path)))
     assert len(model.requests) == 1
     assert model.client.is_closed
+    summary = json.loads(capsys.readouterr().err.splitlines()[-1])
+    assert summary["event"] == "run_end"
+    assert summary["status"] == "step_limit"
+    assert summary["requests"] == 1
+    assert summary["input_tokens"] is None
 
 
 def test_run_timeout_cancels_tool(
-    model: MockModel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    model: MockModel,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     model.respond(call('{"command": "unused"}'))
     cancelled: list[bool] = []
 
-    async def slow_tool(arguments: str, cwd: Path, *, max_output_bytes: int) -> str:
+    async def slow_tool(
+        arguments: str, cwd: Path, *, max_output_bytes: int, stats: tools.ShellStats
+    ) -> str:
         try:
             await asyncio.sleep(60)
         finally:
@@ -207,13 +235,19 @@ def test_run_timeout_cancels_tool(
         asyncio.run(agent.run("Test", RunContext(cwd=tmp_path)))
     assert cancelled == [True]
     assert model.client.is_closed
+    events = [json.loads(line) for line in capsys.readouterr().err.splitlines()]
+    tool_end = next(event for event in events if event["event"] == "tool_end")
+    assert tool_end["status"] == "cancelled"
+    assert events[-1]["status"] == "timeout"
 
 
 @pytest.mark.parametrize("status", ["incomplete", "failed"])
 def test_unfinished_responses_do_not_execute_commands(
     model: MockModel, tmp_path: Path, status: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def unexpected_tool(arguments: str, cwd: Path, *, max_output_bytes: int) -> str:
+    async def unexpected_tool(
+        arguments: str, cwd: Path, *, max_output_bytes: int, stats: tools.ShellStats
+    ) -> str:
         pytest.fail("An unfinished model response must not execute commands.")
 
     monkeypatch.setattr("agents590.yewons_stale_path.execute_shell", unexpected_tool)
@@ -230,7 +264,9 @@ def test_empty_response_is_an_error(model: MockModel, tmp_path: Path) -> None:
         asyncio.run(StalePathAgent().run("Test", RunContext(cwd=tmp_path)))
 
 
-def test_api_error_does_not_expose_provider_details(model: MockModel, tmp_path: Path) -> None:
+def test_api_error_does_not_expose_provider_details(
+    model: MockModel, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     model.replies.append(
         httpx.Response(401, json={"error": {"message": "synthetic-test-key is invalid"}})
     )
@@ -238,6 +274,12 @@ def test_api_error_does_not_expose_provider_details(model: MockModel, tmp_path: 
         asyncio.run(StalePathAgent().run("Test", RunContext(cwd=tmp_path)))
     assert "synthetic-test-key" not in str(error.value)
     assert model.client.is_closed
+    logs = capsys.readouterr().err
+    assert "synthetic-test-key" not in logs
+    summary = json.loads(logs.splitlines()[-1])
+    assert summary["status"] == "api_error"
+    assert summary["requests"] == 1
+    assert summary["responses"] == 0
 
 
 @pytest.mark.parametrize(
@@ -266,8 +308,13 @@ def test_shell_returns_failure_and_bounded_output(tmp_path: Path) -> None:
         "print('ERR_START' + 'e' * 50000 + 'failed check', file=sys.stderr)\n"
         "raise SystemExit(7)\n"
     )
+    stats = tools.ShellStats()
     output = json.loads(
-        asyncio.run(tools.execute_shell(json.dumps({"command": python_command(script)}), tmp_path))
+        asyncio.run(
+            tools.execute_shell(
+                json.dumps({"command": python_command(script)}), tmp_path, stats=stats
+            )
+        )
     )
     assert output["exit_code"] == 7
     assert output["stdout"].startswith("OUT_START")
@@ -278,12 +325,18 @@ def test_shell_returns_failure_and_bounded_output(tmp_path: Path) -> None:
     assert "output truncated" in output["stdout"]
     assert len(output["stdout"]) < tools.MAX_OUTPUT_BYTES + 100
     assert len(output["stderr"]) < tools.MAX_OUTPUT_BYTES + 100
+    assert stats.stdout.total_bytes > 50_000
+    assert stats.stderr.total_bytes > 50_000
+    assert stats.stdout.retained_bytes == tools.MAX_OUTPUT_BYTES
+    assert stats.stderr.retained_bytes == tools.MAX_OUTPUT_BYTES
+    assert set(output) == {"exit_code", "stdout", "stderr"}
 
 
 @pytest.mark.parametrize("limit", [1, 7, 8])
 @pytest.mark.parametrize("size", [0, 1, 7, 8, 9, 9000])
 def test_output_reader_preserves_boundaries_and_omission_count(limit: int, size: int) -> None:
     data = (b"abcdefghijklmnopqrstuvwxyz" * 347)[:size]
+    stats = tools.OutputStats()
 
     async def exercise() -> str:
         stream = asyncio.StreamReader()
@@ -296,11 +349,17 @@ def test_output_reader_preserves_boundaries_and_omission_count(limit: int, size:
 
         producer = asyncio.create_task(feed())
         try:
-            return await tools._read_output(stream, limit)
+            return await tools._read_output(stream, limit, stats=stats)
         finally:
             await producer
 
     output = asyncio.run(exercise())
+    assert stats.as_dict() == {
+        "total_bytes": size,
+        "retained_bytes": min(size, limit),
+        "omitted_bytes": max(0, size - limit),
+        "truncated": size > limit,
+    }
     if size <= limit:
         assert output == data.decode()
     else:
@@ -314,7 +373,9 @@ def test_output_reader_preserves_boundaries_and_omission_count(limit: int, size:
         )
 
 
-def test_agent_uses_custom_output_limit(model: MockModel, tmp_path: Path) -> None:
+def test_agent_uses_custom_output_limit(
+    model: MockModel, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     script = tmp_path / "output.py"
     script.write_text("print('START' + 'x' * 100 + 'END')\n")
     model.respond(call(json.dumps({"command": python_command(script)})))
@@ -331,6 +392,16 @@ def test_agent_uses_custom_output_limit(model: MockModel, tmp_path: Path) -> Non
     expected_bytes = len(("START" + "x" * 100 + "END" + os.linesep).encode())
     assert f"{expected_bytes - 16} bytes omitted" in output["stdout"]
     assert output["stderr"] == ""
+    events = [json.loads(line) for line in capsys.readouterr().err.splitlines()]
+    tool_end = next(event for event in events if event["event"] == "tool_end")
+    assert tool_end["stdout"] == {
+        "total_bytes": expected_bytes,
+        "retained_bytes": 16,
+        "omitted_bytes": expected_bytes - 16,
+        "truncated": True,
+    }
+    assert tool_end["stderr"]["truncated"] is False
+    assert tool_end["result_bytes"] == len(model.requests[1]["input"][-1]["output"].encode())
 
 
 @pytest.mark.parametrize("limit", [0, -1])
@@ -350,10 +421,13 @@ def test_command_timeout_stops_child_process(
         "time.sleep(2)\nPath('late.txt').write_text('orphaned process')\n"
     )
     monkeypatch.setattr(tools, "COMMAND_TIMEOUT_SECONDS", 1.0)
+    stats = tools.ShellStats()
 
     async def exercise() -> dict[str, object]:
         output = json.loads(
-            await tools.execute_shell(json.dumps({"command": python_command(script)}), tmp_path)
+            await tools.execute_shell(
+                json.dumps({"command": python_command(script)}), tmp_path, stats=stats
+            )
         )
         await asyncio.sleep(2)
         return output
@@ -361,6 +435,93 @@ def test_command_timeout_stops_child_process(
     output = asyncio.run(exercise())
     assert "time limit" in str(output["error"])
     assert not (tmp_path / "late.txt").exists()
+    assert stats.timed_out is True
+
+
+def test_diagnostic_events_include_usage_commands_and_failures(
+    model: MockModel,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def usage(input_tokens: int, output_tokens: int, cached_tokens: int) -> dict[str, object]:
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "input_tokens_details": {"cached_tokens": cached_tokens, "cache_write_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 3},
+        }
+
+    command = "git diff # synthetic-test-key"
+    model.respond(call(json.dumps({"command": command})), usage=usage(100, 20, 10))
+    model.respond(message("Git unavailable; check files directly."), usage=usage(150, 30, 50))
+
+    async def failed_tool(
+        arguments: str, cwd: Path, *, max_output_bytes: int, stats: tools.ShellStats
+    ) -> str:
+        assert json.loads(arguments)["command"] == command
+        error_output = "git: not found"
+        stats.stderr.total_bytes = len(error_output)
+        stats.stderr.retained_bytes = len(error_output)
+        return json.dumps({"exit_code": 127, "stdout": "", "stderr": error_output})
+
+    monkeypatch.setattr("agents590.yewons_stale_path.execute_shell", failed_tool)
+    assert asyncio.run(StalePathAgent().run("Test", RunContext(cwd=tmp_path))) == (
+        "Git unavailable; check files directly."
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "synthetic-test-key" not in captured.err
+    events = [json.loads(line) for line in captured.err.splitlines()]
+    assert [event["event"] for event in events] == [
+        "run_start",
+        "model_request",
+        "model_response",
+        "tool_start",
+        "tool_end",
+        "model_request",
+        "model_response",
+        "run_end",
+    ]
+    assert events[2]["input_tokens"] == 100
+    assert events[2]["cached_tokens"] == 10
+    assert events[2]["reasoning_tokens"] == 3
+    assert events[3]["command"] == "git diff # [REDACTED]"
+    assert events[3]["call_id"] == events[4]["call_id"] == "call_1"
+    assert events[3]["step"] == events[4]["step"] == 1
+    assert events[4]["exit_code"] == 127
+    assert events[4]["status"] == "failed"
+    assert events[4]["stderr_excerpt"] == "git: not found"
+    assert events[4]["duration_ms"] >= 0
+    assert events[5]["history_items"] > events[1]["history_items"]
+    assert events[-1]["status"] == "completed"
+    assert events[-1]["requests"] == events[-1]["responses"] == 2
+    assert events[-1]["tool_calls"] == 1
+    assert events[-1]["input_tokens"] == 250
+    assert events[-1]["output_tokens"] == 50
+    assert events[-1]["cached_tokens"] == 60
+    # Diagnostics never become extra context sent to the model.
+    assert set(json.loads(model.requests[1]["input"][-1]["output"])) == {
+        "exit_code",
+        "stdout",
+        "stderr",
+    }
+
+
+def test_diagnostic_text_is_bounded_and_redacted_before_clipping(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret = 'synthetic-"key\\value'
+    log = RunDiagnostics((secret,))
+    command = "a" * 2040 + secret + "b" * 5000
+    log.emit("tool_start", command=log.text(command), error=secret)
+    captured = capsys.readouterr()
+    event = json.loads(captured.err)
+    assert "synthetic" not in captured.err
+    assert event["error"] == "[REDACTED]"
+    assert "[log text truncated]" in event["command"]
+    assert len(event["command"]) < 4200
 
 
 def test_missing_working_directory_is_a_tool_error(tmp_path: Path) -> None:

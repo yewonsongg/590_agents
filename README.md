@@ -28,6 +28,12 @@ stale resource paths, then check the changes. It uses the shared UNC Azure setti
 and runs commands in the selected working directory, with time and output limits.
 Each shell output stream retains up to 4,096 bytes, keeping the beginning and end
 of longer output. Set `StalePathAgent.max_shell_output_bytes` to adjust this limit.
+Diagnostic JSON events go to stderr: model steps and token/cache counts, shell
+commands and exit codes, timings, output truncation counts, and a run summary.
+Harbor captures these in the trial's agent logs. For a direct CLI run, append
+`2> agent-events.jsonl` to save them. Logs stay out of model context; known provider
+keys are redacted, command text and error excerpts are bounded, and full output
+bodies and reasoning content are omitted.
 
 For use outside this checkout:
 

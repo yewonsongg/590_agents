@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import signal
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
@@ -12,6 +13,32 @@ from openai.types.responses import FunctionToolParam
 COMMAND_TIMEOUT_SECONDS = 10.0
 MAX_OUTPUT_BYTES = 4096
 SHELL_NAME = "PowerShell" if os.name == "nt" else "POSIX /bin/sh"
+
+
+@dataclass
+class OutputStats:
+    """Raw byte counts, excluding truncation markers and UTF-8 replacement characters."""
+
+    total_bytes: int = 0
+    retained_bytes: int = 0
+
+    def as_dict(self) -> dict[str, int | bool]:
+        omitted = self.total_bytes - self.retained_bytes
+        return {
+            "total_bytes": self.total_bytes,
+            "retained_bytes": self.retained_bytes,
+            "omitted_bytes": omitted,
+            "truncated": omitted > 0,
+        }
+
+
+@dataclass
+class ShellStats:
+    """Measurements kept outside the tool result sent back to the model."""
+
+    stdout: OutputStats = field(default_factory=OutputStats)
+    stderr: OutputStats = field(default_factory=OutputStats)
+    timed_out: bool = False
 
 
 def shell_tool(max_output_bytes: int = MAX_OUTPUT_BYTES) -> FunctionToolParam:
@@ -38,12 +65,15 @@ def shell_tool(max_output_bytes: int = MAX_OUTPUT_BYTES) -> FunctionToolParam:
     }
 
 
-async def _read_output(stream: asyncio.StreamReader, max_output_bytes: int) -> str:
+async def _read_output(
+    stream: asyncio.StreamReader, max_output_bytes: int, *, stats: OutputStats | None = None
+) -> str:
     """Drain pipes while retaining a bounded beginning and rolling end."""
     head_limit = (max_output_bytes + 1) // 2
     tail_limit = max_output_bytes // 2
     head = bytearray()
     tail = bytearray()
+    stats = stats if stats is not None else OutputStats()
     total = 0
     while chunk := await stream.read(4096):
         total += len(chunk)
@@ -52,6 +82,8 @@ async def _read_output(stream: asyncio.StreamReader, max_output_bytes: int) -> s
         if tail_limit:
             tail.extend(chunk[head_count:])
             del tail[:-tail_limit]
+        stats.total_bytes = total
+        stats.retained_bytes = len(head) + len(tail)
     if total <= max_output_bytes:
         return (head + tail).decode("utf-8", errors="replace")
     omitted = total - len(head) - len(tail)
@@ -93,11 +125,16 @@ async def _stop_process(process: asyncio.subprocess.Process) -> None:
 
 
 async def execute_shell(
-    arguments: str, cwd: Path, *, max_output_bytes: int = MAX_OUTPUT_BYTES
+    arguments: str,
+    cwd: Path,
+    *,
+    max_output_bytes: int = MAX_OUTPUT_BYTES,
+    stats: ShellStats | None = None,
 ) -> str:
     """Validate tool arguments and return a JSON result, including recoverable failures."""
     if max_output_bytes < 1:
         raise ValueError("Shell output limit must be a positive number of bytes.")
+    stats = stats if stats is not None else ShellStats()
     try:
         payload: object = json.loads(arguments)
     except ValueError:
@@ -128,14 +165,15 @@ async def execute_shell(
         return json.dumps({"error": f"Could not start shell: {error}"})
     assert process.stdout is not None and process.stderr is not None
     readers = [
-        asyncio.create_task(_read_output(process.stdout, max_output_bytes)),
-        asyncio.create_task(_read_output(process.stderr, max_output_bytes)),
+        asyncio.create_task(_read_output(process.stdout, max_output_bytes, stats=stats.stdout)),
+        asyncio.create_task(_read_output(process.stderr, max_output_bytes, stats=stats.stderr)),
     ]
     try:
         async with asyncio.timeout(COMMAND_TIMEOUT_SECONDS):
             await process.wait()
             stdout, stderr = await asyncio.gather(*readers)
     except (TimeoutError, asyncio.CancelledError) as error:
+        stats.timed_out = isinstance(error, TimeoutError)
         await _stop_process(process)
         for reader in readers:
             reader.cancel()
