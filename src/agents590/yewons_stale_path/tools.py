@@ -22,16 +22,15 @@ def shell_tool(max_output_bytes: int = MAX_OUTPUT_BYTES) -> FunctionToolParam:
         "type": "function",
         "name": "shell",
         "description": (
-            f"Run a foreground {SHELL_NAME} command in the task working directory to inspect, "
-            "edit, or verify project files. Python is available. Directory changes do not persist. "
-            f"Commands time out after {COMMAND_TIMEOUT_SECONDS:g} seconds; each output stream "
-            f"retains at most {max_output_bytes} bytes, keeping its beginning and end when "
-            "truncated and marking omitted bytes. Returns JSON with exit_code, stdout, stderr, "
-            "or an error."
+            f"Run foreground {SHELL_NAME} commands in the task directory. Python is available. "
+            "Each call starts there; directory changes do not persist. "
+            f"Timeout: {COMMAND_TIMEOUT_SECONDS:g}s. Per stream: {max_output_bytes} bytes, "
+            "preserving beginning/end and marking omissions. "
+            "Returns JSON: exit_code, stdout, stderr, or error."
         ),
         "parameters": {
             "type": "object",
-            "properties": {"command": {"type": "string", "description": "The command to execute."}},
+            "properties": {"command": {"type": "string"}},
             "required": ["command"],
             "additionalProperties": False,
         },
