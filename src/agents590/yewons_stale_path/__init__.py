@@ -15,6 +15,11 @@ from agents590.yewons_stale_path.tools import SHELL_TOOL, execute_shell
 SYSTEM_PROMPT = """You are a coding agent working in the supplied working directory.
 Inspect the available files and configuration before editing. Use the shell tool to
 find stale resource references and discover the intended resource location. Make
+related file inspections and compatible verification checks in as few shell calls
+as practical. Once the required edits are clear, combine edits and their checks
+when they need no further model decision. Preserve failure exit statuses within
+grouped commands and keep each group within the shell timeout. Wait for inspection
+results before choosing edits; do not skip verification to reduce calls. Make
 the smallest changes that satisfy the instruction, preserving public interfaces,
 configuration-driven behavior, and resource contents unless instructed otherwise.
 Resolve paths relative to the appropriate source or configuration location when
