@@ -193,7 +193,7 @@ def test_run_timeout_cancels_tool(
     model.respond(call('{"command": "unused"}'))
     cancelled: list[bool] = []
 
-    async def slow_tool(arguments: str, cwd: Path) -> str:
+    async def slow_tool(arguments: str, cwd: Path, *, max_output_bytes: int) -> str:
         try:
             await asyncio.sleep(60)
         finally:
@@ -213,7 +213,7 @@ def test_run_timeout_cancels_tool(
 def test_unfinished_responses_do_not_execute_commands(
     model: MockModel, tmp_path: Path, status: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def unexpected_tool(arguments: str, cwd: Path) -> str:
+    async def unexpected_tool(arguments: str, cwd: Path, *, max_output_bytes: int) -> str:
         pytest.fail("An unfinished model response must not execute commands.")
 
     monkeypatch.setattr("agents590.yewons_stale_path.execute_shell", unexpected_tool)
@@ -262,17 +262,83 @@ def test_shell_returns_failure_and_bounded_output(tmp_path: Path) -> None:
     script = tmp_path / "fail.py"
     script.write_text(
         "import sys\n"
-        "print('x' * 50000)\n"
-        "print('failed check', file=sys.stderr)\n"
+        "print('OUT_START' + 'x' * 50000 + 'OUT_END')\n"
+        "print('ERR_START' + 'e' * 50000 + 'failed check', file=sys.stderr)\n"
         "raise SystemExit(7)\n"
     )
     output = json.loads(
         asyncio.run(tools.execute_shell(json.dumps({"command": python_command(script)}), tmp_path))
     )
     assert output["exit_code"] == 7
+    assert output["stdout"].startswith("OUT_START")
+    assert output["stdout"].rstrip().endswith("OUT_END")
+    assert output["stderr"].startswith("ERR_START")
+    assert output["stderr"].rstrip().endswith("failed check")
     assert "failed check" in output["stderr"]
     assert "output truncated" in output["stdout"]
     assert len(output["stdout"]) < tools.MAX_OUTPUT_BYTES + 100
+    assert len(output["stderr"]) < tools.MAX_OUTPUT_BYTES + 100
+
+
+@pytest.mark.parametrize("limit", [1, 7, 8])
+@pytest.mark.parametrize("size", [0, 1, 7, 8, 9, 9000])
+def test_output_reader_preserves_boundaries_and_omission_count(limit: int, size: int) -> None:
+    data = (b"abcdefghijklmnopqrstuvwxyz" * 347)[:size]
+
+    async def exercise() -> str:
+        stream = asyncio.StreamReader()
+
+        async def feed() -> None:
+            for offset in range(0, len(data), 3):
+                stream.feed_data(data[offset : offset + 3])
+                await asyncio.sleep(0)
+            stream.feed_eof()
+
+        producer = asyncio.create_task(feed())
+        try:
+            return await tools._read_output(stream, limit)
+        finally:
+            await producer
+
+    output = asyncio.run(exercise())
+    if size <= limit:
+        assert output == data.decode()
+    else:
+        head_size = (limit + 1) // 2
+        tail_size = limit // 2
+        expected_tail = data[-tail_size:].decode() if tail_size else ""
+        assert output == (
+            data[:head_size].decode()
+            + f"\n[output truncated: {size - limit} bytes omitted]\n"
+            + expected_tail
+        )
+
+
+def test_agent_uses_custom_output_limit(model: MockModel, tmp_path: Path) -> None:
+    script = tmp_path / "output.py"
+    script.write_text("print('START' + 'x' * 100 + 'END')\n")
+    model.respond(call(json.dumps({"command": python_command(script)})))
+    model.respond(message("Checked output."))
+    agent = StalePathAgent()
+    agent.max_shell_output_bytes = 16
+
+    assert asyncio.run(agent.run("Test", RunContext(cwd=tmp_path))) == "Checked output."
+
+    assert "16 bytes" in model.requests[0]["tools"][0]["description"]
+    output = json.loads(model.requests[1]["input"][-1]["output"])
+    assert output["stdout"].startswith("STARTxxx")
+    assert output["stdout"].rstrip().endswith("END")
+    expected_bytes = len(("START" + "x" * 100 + "END" + os.linesep).encode())
+    assert f"{expected_bytes - 16} bytes omitted" in output["stdout"]
+    assert output["stderr"] == ""
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_invalid_output_limit_fails_before_running_a_command(tmp_path: Path, limit: int) -> None:
+    with pytest.raises(ValueError, match="positive number of bytes"):
+        tools.shell_tool(limit)
+    with pytest.raises(ValueError, match="positive number of bytes"):
+        asyncio.run(tools.execute_shell('{"command": "unused"}', tmp_path, max_output_bytes=limit))
 
 
 def test_command_timeout_stops_child_process(

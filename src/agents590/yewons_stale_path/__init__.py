@@ -10,7 +10,7 @@ from openai.types.responses import ResponseInputItemParam, ResponseInputParam
 
 from agents590.contracts import RunContext
 from agents590.provider import UNCOpenAISettings
-from agents590.yewons_stale_path.tools import SHELL_TOOL, execute_shell
+from agents590.yewons_stale_path.tools import MAX_OUTPUT_BYTES, execute_shell, shell_tool
 
 SYSTEM_PROMPT = """You are a coding agent working in the supplied working directory.
 Inspect the available files and configuration before editing. Use the shell tool to
@@ -40,6 +40,7 @@ class StalePathAgent:
 
     max_steps: int = 12
     max_output_tokens: int = 1024
+    max_shell_output_bytes: int = MAX_OUTPUT_BYTES
     run_timeout_seconds: float = 100.0
 
     def provider_settings(self, context: RunContext) -> UNCOpenAISettings:
@@ -49,6 +50,7 @@ class StalePathAgent:
     async def run(self, instruction: str, context: RunContext) -> str:
         """Inspect, edit, and verify files using model-selected shell commands."""
         settings = self.provider_settings(context)
+        tool = shell_tool(self.max_shell_output_bytes)
         history: ResponseInputParam = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": instruction},
@@ -60,7 +62,7 @@ class StalePathAgent:
                         response = await client.responses.create(
                             model=settings.model,
                             input=history,
-                            tools=[SHELL_TOOL],
+                            tools=[tool],
                             parallel_tool_calls=False,
                             include=["reasoning.encrypted_content"],
                             max_output_tokens=self.max_output_tokens,
@@ -93,7 +95,11 @@ class StalePathAgent:
                             )
                         for call in calls:
                             if call.name == "shell":
-                                result = await execute_shell(call.arguments, context.cwd)
+                                result = await execute_shell(
+                                    call.arguments,
+                                    context.cwd,
+                                    max_output_bytes=self.max_shell_output_bytes,
+                                )
                             else:
                                 result = json.dumps({"error": f"Unknown tool: {call.name}"})
                             history.append(

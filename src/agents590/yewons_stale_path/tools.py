@@ -10,40 +10,57 @@ from typing import cast
 from openai.types.responses import FunctionToolParam
 
 COMMAND_TIMEOUT_SECONDS = 10.0
-MAX_OUTPUT_BYTES = 12_000
+MAX_OUTPUT_BYTES = 4096
 SHELL_NAME = "PowerShell" if os.name == "nt" else "POSIX /bin/sh"
 
-SHELL_TOOL: FunctionToolParam = {
-    "type": "function",
-    "name": "shell",
-    "description": (
-        f"Run a foreground {SHELL_NAME} command in the task working directory to inspect, "
-        "edit, or verify project files. Python is available. Directory changes do not persist. "
-        f"Commands time out after {COMMAND_TIMEOUT_SECONDS:g} seconds; each output stream "
-        f"is limited to {MAX_OUTPUT_BYTES} bytes. Returns JSON with exit_code, stdout, stderr, "
-        "or an error."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {"command": {"type": "string", "description": "The command to execute."}},
-        "required": ["command"],
-        "additionalProperties": False,
-    },
-    "strict": True,
-}
+
+def shell_tool(max_output_bytes: int = MAX_OUTPUT_BYTES) -> FunctionToolParam:
+    """Describe the shell with the same output limit used by its executor."""
+    if max_output_bytes < 1:
+        raise ValueError("Shell output limit must be a positive number of bytes.")
+    return {
+        "type": "function",
+        "name": "shell",
+        "description": (
+            f"Run a foreground {SHELL_NAME} command in the task working directory to inspect, "
+            "edit, or verify project files. Python is available. Directory changes do not persist. "
+            f"Commands time out after {COMMAND_TIMEOUT_SECONDS:g} seconds; each output stream "
+            f"retains at most {max_output_bytes} bytes, keeping its beginning and end when "
+            "truncated and marking omitted bytes. Returns JSON with exit_code, stdout, stderr, "
+            "or an error."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"command": {"type": "string", "description": "The command to execute."}},
+            "required": ["command"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    }
 
 
-async def _read_output(stream: asyncio.StreamReader) -> str:
-    """Drain pipes completely while retaining only a fixed-size prefix in memory."""
-    captured = bytearray()
+async def _read_output(stream: asyncio.StreamReader, max_output_bytes: int) -> str:
+    """Drain pipes while retaining a bounded beginning and rolling end."""
+    head_limit = (max_output_bytes + 1) // 2
+    tail_limit = max_output_bytes // 2
+    head = bytearray()
+    tail = bytearray()
     total = 0
     while chunk := await stream.read(4096):
         total += len(chunk)
-        captured.extend(chunk[: max(0, MAX_OUTPUT_BYTES - len(captured))])
-    text = captured.decode("utf-8", errors="replace")
-    if total > len(captured):
-        text += f"\n[output truncated: {total - len(captured)} bytes omitted]"
-    return text
+        head_count = min(head_limit - len(head), len(chunk))
+        head.extend(chunk[:head_count])
+        if tail_limit:
+            tail.extend(chunk[head_count:])
+            del tail[:-tail_limit]
+    if total <= max_output_bytes:
+        return (head + tail).decode("utf-8", errors="replace")
+    omitted = total - len(head) - len(tail)
+    return (
+        head.decode("utf-8", errors="replace")
+        + f"\n[output truncated: {omitted} bytes omitted]\n"
+        + tail.decode("utf-8", errors="replace")
+    )
 
 
 async def _stop_process(process: asyncio.subprocess.Process) -> None:
@@ -76,8 +93,12 @@ async def _stop_process(process: asyncio.subprocess.Process) -> None:
     await process.wait()
 
 
-async def execute_shell(arguments: str, cwd: Path) -> str:
+async def execute_shell(
+    arguments: str, cwd: Path, *, max_output_bytes: int = MAX_OUTPUT_BYTES
+) -> str:
     """Validate tool arguments and return a JSON result, including recoverable failures."""
+    if max_output_bytes < 1:
+        raise ValueError("Shell output limit must be a positive number of bytes.")
     try:
         payload: object = json.loads(arguments)
     except ValueError:
@@ -108,8 +129,8 @@ async def execute_shell(arguments: str, cwd: Path) -> str:
         return json.dumps({"error": f"Could not start shell: {error}"})
     assert process.stdout is not None and process.stderr is not None
     readers = [
-        asyncio.create_task(_read_output(process.stdout)),
-        asyncio.create_task(_read_output(process.stderr)),
+        asyncio.create_task(_read_output(process.stdout, max_output_bytes)),
+        asyncio.create_task(_read_output(process.stderr, max_output_bytes)),
     ]
     try:
         async with asyncio.timeout(COMMAND_TIMEOUT_SECONDS):

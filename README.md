@@ -26,6 +26,8 @@ per-run model overrides through `RunContext.model`.
 `yewons_stale_path` uses the Responses API and shell commands to find and fix
 stale resource paths, then check the changes. It uses the shared UNC Azure settings
 and runs commands in the selected working directory, with time and output limits.
+Each shell output stream retains up to 4,096 bytes, keeping the beginning and end
+of longer output. Set `StalePathAgent.max_shell_output_bytes` to adjust this limit.
 
 For use outside this checkout:
 
